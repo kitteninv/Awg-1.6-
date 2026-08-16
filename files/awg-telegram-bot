@@ -1,0 +1,1627 @@
+#!/bin/bash
+
+set -u
+
+VERSION="1.6"
+
+CONFIG="/etc/awg-monitor.conf"
+STATE_DIR="/var/lib/awg-monitor"
+OFFSET_FILE="${STATE_DIR}/bot-offset"
+
+CONTAINER="amnezia-awg2"
+AWG_DIR="/opt/amnezia/awg"
+
+source "$CONFIG"
+
+mkdir -p "$STATE_DIR"
+
+API="https://api.telegram.org/bot${BOT_TOKEN}"
+
+api() {
+    curl -4 -sS --connect-timeout 5 --max-time 35 "$@"
+}
+
+json_escape() {
+    printf '%s' "$1" |
+        sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\r//g;s/\n/\\n/g'
+}
+
+send_message() {
+    local CHAT="$1"
+    local TEXT="$2"
+
+    api -X POST "${API}/sendMessage" \
+        -d "chat_id=${CHAT}" \
+        --data-urlencode "text=${TEXT}" \
+        >/dev/null
+}
+
+send_menu() {
+    local CHAT="$1"
+
+    local MARKUP='{
+        "inline_keyboard":[
+            [
+                {"text":"👥 Клиенты","callback_data":"clients"},
+                {"text":"📈 Трафик","callback_data":"traffic"}
+            ],
+            [
+                {"text":"📊 Статус","callback_data":"status"}
+            ],
+            [
+                {"text":"🔴 Проблемы","callback_data":"problems"},
+                {"text":"🖥 Сервер","callback_data":"health"},
+                {"text":"🔄 Обновить","callback_data":"menu"}
+            ]
+        ]
+    }'
+
+    api -X POST "${API}/sendMessage" \
+        -d "chat_id=${CHAT}" \
+        --data-urlencode "text=⚡ AMNEZIA AWG MANAGER v${VERSION}" \
+        --data-urlencode "reply_markup=${MARKUP}" \
+        >/dev/null
+}
+
+edit_message() {
+    local CHAT="$1"
+    local MESSAGE_ID="$2"
+    local TEXT="$3"
+    local MARKUP="${4:-}"
+
+    if [ -n "$MARKUP" ]; then
+        api -X POST "${API}/editMessageText" \
+            -d "chat_id=${CHAT}" \
+            -d "message_id=${MESSAGE_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "reply_markup=${MARKUP}" \
+        >/dev/null
+    else
+        api -X POST "${API}/editMessageText" \
+            -d "chat_id=${CHAT}" \
+            -d "message_id=${MESSAGE_ID}" \
+            --data-urlencode "text=${TEXT}" \
+        >/dev/null
+    fi
+}
+
+answer_callback() {
+    local QUERY_ID="$1"
+
+    api -X POST "${API}/answerCallbackQuery" \
+        -d "callback_query_id=${QUERY_ID}" \
+        >/dev/null
+}
+
+# Кэш данных AWG для ускоренной работы бота
+AWG_CACHE_TIME=0
+AWG_CACHE_TTL=3
+
+declare -A CACHE_NAME
+declare -A CACHE_PUB
+declare -A CACHE_IP
+declare -A CACHE_KEY
+declare -A CACHE_HS
+declare -A CACHE_RX
+declare -A CACHE_TX
+declare -A CACHE_USED
+
+refresh_awg_cache() {
+    local NOW
+    NOW=$(date +%s)
+
+    if [ "$((NOW - AWG_CACHE_TIME))" -lt "$AWG_CACHE_TTL" ]; then
+        return
+    fi
+
+    AWG_CACHE_TIME="$NOW"
+
+    CACHE_NAME=()
+    CACHE_PUB=()
+    CACHE_IP=()
+    CACHE_KEY=()
+    CACHE_HS=()
+    CACHE_RX=()
+    CACHE_TX=()
+    CACHE_USED=()
+
+    #
+    # 1. Один docker exec:
+    #    awg0.conf + clientsTable
+    #
+    local DATA
+    DATA=$(docker exec "$CONTAINER" sh -c \
+        'printf "__AWG_CONF__\n"; cat /opt/amnezia/awg/awg0.conf; printf "\n__CLIENTS_TABLE__\n"; cat /opt/amnezia/awg/clientsTable' \
+        2>/dev/null)
+
+    #
+    # Сначала строим IP <-> PublicKey из awg0.conf
+    #
+    local MODE=""
+    local PUB=""
+    local IP=""
+    local NAME=""
+
+    while IFS= read -r line; do
+
+        if [ "$line" = "__AWG_CONF__" ]; then
+            MODE="AWG"
+            PUB=""
+            IP=""
+            continue
+        fi
+
+        if [ "$line" = "__CLIENTS_TABLE__" ]; then
+            MODE="TABLE"
+            PUB=""
+            IP=""
+            NAME=""
+            continue
+        fi
+
+        if [ "$MODE" = "AWG" ]; then
+
+            if [[ "$line" =~ ^PublicKey[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+                PUB="${BASH_REMATCH[1]}"
+                continue
+            fi
+
+            if [[ "$line" =~ ^AllowedIPs[[:space:]]*=[[:space:]]*(10\.8\.1\.[0-9]+)/32$ ]]; then
+                IP="${BASH_REMATCH[1]}"
+
+                if [ -n "$PUB" ]; then
+                    CACHE_PUB["$IP"]="$PUB"
+                    CACHE_IP["$PUB"]="$IP"
+                fi
+
+                continue
+            fi
+
+        elif [ "$MODE" = "TABLE" ]; then
+
+            if [[ "$line" =~ \"clientId\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+                PUB="${BASH_REMATCH[1]}"
+                IP="${CACHE_IP[$PUB]:-}"
+                NAME=""
+                continue
+            fi
+
+            if [[ "$line" =~ \"allowedIps\"[[:space:]]*:[[:space:]]*\"(10\.8\.1\.[0-9]+)/32\" ]]; then
+                IP="${BASH_REMATCH[1]}"
+                CACHE_PUB["$IP"]="$PUB"
+                CACHE_IP["$PUB"]="$IP"
+                continue
+            fi
+
+            if [[ "$line" =~ \"allowed_ips\"[[:space:]]*:[[:space:]]*\"(10\.8\.1\.[0-9]+)/32\" ]]; then
+                IP="${BASH_REMATCH[1]}"
+                CACHE_PUB["$IP"]="$PUB"
+                CACHE_IP["$PUB"]="$IP"
+                continue
+            fi
+
+            if [[ "$line" =~ \"clientName\"[[:space:]]*:[[:space:]]*\"(.*)\" ]]; then
+                NAME="${BASH_REMATCH[1]}"
+                NAME="${NAME//\\n/ }"
+                NAME="$(printf '%s' "$NAME" | sed 's/[[:space:]]*$//')"
+
+                if [ -n "$IP" ]; then
+                    CACHE_NAME["$IP"]="$NAME"
+                elif [ -n "$PUB" ] && [ -n "${CACHE_IP[$PUB]:-}" ]; then
+                    CACHE_NAME["${CACHE_IP[$PUB]}"]="$NAME"
+                fi
+
+                continue
+            fi
+
+            if [[ "$line" =~ \"latestHandshake\"[[:space:]]*:[[:space:]]*\"(.*)\" ]]; then
+                CACHE_USED["$IP"]="YES"
+            fi
+        fi
+
+    done <<< "$DATA"
+
+    #
+    # 2. Один docker exec:
+    #    dump содержит сразу:
+    #    PublicKey
+    #    AllowedIPs
+    #    latestHandshake
+    #    RX
+    #    TX
+    #
+    local DUMP
+    DUMP=$(docker exec "$CONTAINER" awg show awg0 dump 2>/dev/null)
+
+    local FIRST=1
+    local KEY PSK ENDPOINT ALLOWED HS RX TX KEEPALIVE
+
+    while read -r KEY PSK ENDPOINT ALLOWED HS RX TX KEEPALIVE; do
+
+        [ -z "$KEY" ] && continue
+
+        # Первая строка dump — параметры интерфейса
+        if [ "$FIRST" -eq 1 ]; then
+            FIRST=0
+            continue
+        fi
+
+        [[ "$ALLOWED" != 10.8.1.*"/32" ]] && continue
+
+        IP="${ALLOWED%/32}"
+
+        CACHE_KEY["$IP"]="$KEY"
+        CACHE_HS["$IP"]="${HS:-0}"
+        CACHE_RX["$IP"]="${RX:-0}"
+        CACHE_TX["$IP"]="${TX:-0}"
+
+    done <<< "$DUMP"
+}
+
+get_name() {
+    local IP="$1"
+    echo "${CACHE_NAME[$IP]:-$IP}"
+}
+
+get_key() {
+    local IP="$1"
+    echo "${CACHE_KEY[$IP]:-}"
+}
+
+get_handshake() {
+    local KEY="$1"
+
+    local IP
+    for IP in "${!CACHE_KEY[@]}"; do
+        if [ "${CACHE_KEY[$IP]}" = "$KEY" ]; then
+            echo "${CACHE_HS[$IP]:-0}"
+            return
+        fi
+    done
+
+    echo "0"
+}
+
+get_status() {
+    local IP="$1"
+
+    # IP существует в постоянном awg0.conf,
+    # но отсутствует в работающем AWG = PAUSED
+    if [ -z "${CACHE_PUB[$IP]:-}" ]; then
+        echo "NEVER"
+        return
+    fi
+
+    if [ -z "${CACHE_KEY[$IP]:-}" ]; then
+        echo "PAUSED"
+        return
+    fi
+
+    local HS="${CACHE_HS[$IP]:-0}"
+
+    if [ -z "$HS" ] || [ "$HS" = "0" ]; then
+        if [ "${CACHE_USED[$IP]:-}" = "YES" ]; then
+            echo "OFF"
+        else
+            echo "NEVER"
+        fi
+        return
+    fi
+
+    local AGE
+    AGE=$(( $(date +%s) - HS ))
+
+    if [ "$AGE" -lt "${OFF_TIMEOUT:-1800}" ]; then
+        echo "ACTIVE"
+    else
+        echo "OFF"
+    fi
+}
+
+
+get_clients() {
+    # Берём ВСЕХ клиентов из постоянного awg0.conf.
+    # Это позволяет видеть даже клиентов, которые ещё ни разу
+    # не подключались, а также клиентов, поставленных на паузу.
+    docker exec "$CONTAINER" awk '
+        /^AllowedIPs[[:space:]]*=/ {
+            x=$0
+            sub(/^[^=]*=[[:space:]]*/, "", x)
+
+            if (x ~ /^10\.8\.1\.[0-9]+\/32$/) {
+                sub(/\/32$/, "", x)
+                print x
+            }
+        }
+    ' "$AWG_DIR/awg0.conf" 2>/dev/null | sort -V
+}
+
+status_icon() {
+    case "$1" in
+        ACTIVE) echo "🟢" ;;
+        OFF)    echo "🔴" ;;
+        NEVER)  echo "⚪" ;;
+        PAUSED) echo "🟡" ;;
+        *)      echo "⚪" ;;
+    esac
+}
+
+status_name() {
+    case "$1" in
+        ACTIVE) echo "ONLINE" ;;
+        OFF)    echo "OFFLINE" ;;
+        NEVER)  echo "NEVER USED" ;;
+        PAUSED) echo "PAUSED" ;;
+        *)      echo "UNKNOWN" ;;
+    esac
+}
+
+clients_markup() {
+    local JSON='{"inline_keyboard":['
+    local FIRST=1
+
+    while read -r IP; do
+        [ -z "$IP" ] && continue
+
+        local NAME
+        NAME=$(get_name "$IP")
+        [ -z "$NAME" ] && NAME="$IP"
+
+        local STATUS
+        STATUS=$(get_status "$IP")
+
+        local ICON
+        ICON=$(status_icon "$STATUS")
+
+        local SAFE_NAME
+        SAFE_NAME=$(json_escape "$NAME")
+
+        if [ "$FIRST" -eq 0 ]; then
+            JSON+=","
+        fi
+
+        JSON+="[{\"text\":\"${ICON} ${SAFE_NAME} — ${IP}\",\"callback_data\":\"client:${IP}\"}]"
+
+        FIRST=0
+    done < <(get_clients)
+
+    JSON+=',[
+        {"text":"🔄 Обновить","callback_data":"clients"},
+        {"text":"🏠 Главное меню","callback_data":"menu"}
+    ]]}'
+
+    printf '%s' "$JSON"
+}
+
+format_bytes() {
+    local BYTES="${1:-0}"
+
+    if [ "$BYTES" -ge 1073741824 ]; then
+        awk -v b="$BYTES" 'BEGIN {printf "%.2f GB", b/1073741824}'
+    elif [ "$BYTES" -ge 1048576 ]; then
+        awk -v b="$BYTES" 'BEGIN {printf "%.1f MB", b/1048576}'
+    elif [ "$BYTES" -ge 1024 ]; then
+        awk -v b="$BYTES" 'BEGIN {printf "%.1f KB", b/1024}'
+    else
+        echo "${BYTES} B"
+    fi
+}
+
+traffic_text() {
+    local MONTH
+    MONTH=$(date +%Y-%m)
+
+    local MONTH_FILE="/var/lib/awg-traffic/${MONTH}.tsv"
+
+    local TEXT="📈 ТРАФИК — ${MONTH}
+
+"
+    local TOTAL=0
+
+    [ -f "$MONTH_FILE" ] || {
+        TEXT+="Нет данных"
+        printf '%s' "$TEXT"
+        return
+    }
+
+    local TMP
+    TMP=$(mktemp)
+
+    while IFS=$'\t' read -r IP TRAFFIC; do
+        [ -z "$IP" ] && continue
+
+        TRAFFIC="${TRAFFIC:-0}"
+        TOTAL=$((TOTAL + TRAFFIC))
+
+        NAME=$(get_name "$IP")
+        [ -z "$NAME" ] && NAME="$IP"
+
+        printf '%020d\t%s\t%s\n' "$TRAFFIC" "$IP" "$NAME" >> "$TMP"
+    done < "$MONTH_FILE"
+
+    while IFS=$'\t' read -r SORTED IP NAME; do
+        TRAFFIC="${SORTED#0}"
+        TRAFFIC="${TRAFFIC:-0}"
+
+        TEXT+="👤 ${NAME}
+${IP} — $(format_bytes "$TRAFFIC")
+
+"
+    done < <(sort -r "$TMP")
+
+    rm -f "$TMP"
+
+    TEXT+="━━━━━━━━━━━━━━
+📊 ВСЕГО: $(format_bytes "$TOTAL")"
+
+    printf '%s' "$TEXT"
+}
+
+traffic_markup() {
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"🔄 Обновить","callback_data":"traffic"},
+                {"text":"📚 Архив","callback_data":"traffic_archive"}
+            ],
+            [
+                {"text":"👥 Клиенты","callback_data":"clients"},
+                {"text":"🏠 Главное меню","callback_data":"menu"}
+            ]
+        ]
+    }'
+}
+
+traffic_archive_text() {
+    local TEXT="📚 АРХИВ ТРАФИКА
+
+"
+    local FOUND=0
+    local MONTH
+    local FILE
+    local TOTAL
+
+    # Месяцы — от нового к старому
+    for FILE in $(find /var/lib/awg-traffic/archive -maxdepth 1 -type f -name '20??-??.tsv' 2>/dev/null | sort -r); do
+        [ -f "$FILE" ] || continue
+
+        MONTH=$(basename "$FILE" .tsv)
+
+        TOTAL=$(awk '{sum += $2} END {printf "%.2f GB", sum/1073741824}' "$FILE")
+
+        TEXT+="📅 ${MONTH}
+📊 ${TOTAL}
+
+"
+
+        FOUND=1
+    done
+
+    if [ "$FOUND" -eq 0 ]; then
+        TEXT+="Архив пока пуст."
+    fi
+
+    printf '%s' "$TEXT"
+}
+
+traffic_archive_markup() {
+    local JSON='{"inline_keyboard":['
+    local FIRST=1
+    local FILE
+    local MONTH
+
+    for FILE in $(find /var/lib/awg-traffic/archive -maxdepth 1 -type f -name '20??-??.tsv' 2>/dev/null | sort -r); do
+        [ -f "$FILE" ] || continue
+
+        MONTH=$(basename "$FILE" .tsv)
+
+        if [ "$FIRST" -eq 0 ]; then
+            JSON+=','
+        fi
+
+        JSON+='[{"text":"📅 '"${MONTH}"'","callback_data":"traffic_archive_month:'"${MONTH}"'"}]'
+
+        FIRST=0
+    done
+
+    JSON+='],[
+        {"text":"◀️ Назад к трафику","callback_data":"traffic"},
+        {"text":"🏠 Главное меню","callback_data":"menu"}
+    ]]}'
+
+    printf '%s' "$JSON"
+}
+
+traffic_archive_month_text() {
+    local MONTH="$1"
+    local FILE
+
+    case "$MONTH" in
+        20??-??) ;;
+        *) printf 'Ошибка месяца'; return 1 ;;
+    esac
+
+    if [ -f "/var/lib/awg-traffic/archive/${MONTH}.tsv" ]; then
+        FILE="/var/lib/awg-traffic/archive/${MONTH}.tsv"
+    elif [ -f "/var/lib/awg-traffic/${MONTH}.tsv" ]; then
+        FILE="/var/lib/awg-traffic/${MONTH}.tsv"
+    else
+        printf '📚 АРХИВ\n\nНет данных за %s' "$MONTH"
+        return 0
+    fi
+
+    local MON="${MONTH:5:2}"
+    local YEAR="${MONTH:0:4}"
+    local MONTH_NAME
+
+    case "$MON" in
+        01) MONTH_NAME="Январь" ;;
+        02) MONTH_NAME="Февраль" ;;
+        03) MONTH_NAME="Март" ;;
+        04) MONTH_NAME="Апрель" ;;
+        05) MONTH_NAME="Май" ;;
+        06) MONTH_NAME="Июнь" ;;
+        07) MONTH_NAME="Июль" ;;
+        08) MONTH_NAME="Август" ;;
+        09) MONTH_NAME="Сентябрь" ;;
+        10) MONTH_NAME="Октябрь" ;;
+        11) MONTH_NAME="Ноябрь" ;;
+        12) MONTH_NAME="Декабрь" ;;
+        *) MONTH_NAME="$MON" ;;
+    esac
+
+    # Загружаем имена клиентов один раз
+    refresh_awg_cache
+
+    local TEXT="📅 ${MONTH_NAME} ${YEAR}
+
+"
+    local TOTAL=0
+    local TMP
+
+    TMP=$(mktemp)
+
+    while IFS=$'\t' read -r IP TRAFFIC; do
+        [ -z "$IP" ] && continue
+
+        TRAFFIC="${TRAFFIC:-0}"
+
+        # Не показываем клиентов без трафика
+        [ "$TRAFFIC" -gt 0 ] || continue
+
+        TOTAL=$((TOTAL + TRAFFIC))
+
+        local NAME
+        NAME="${CACHE_NAME[$IP]:-$IP}"
+
+        printf '%020d\t%s\t%s\n' \
+            "$TRAFFIC" "$IP" "$NAME" >> "$TMP"
+
+    done < "$FILE"
+
+    while IFS=$'\t' read -r SORTED IP NAME; do
+        local TRAFFIC
+        TRAFFIC="${SORTED#0}"
+        TRAFFIC="${TRAFFIC:-0}"
+
+        TEXT+="👤 ${NAME}
+${IP} — $(format_bytes "$TRAFFIC")
+
+"
+    done < <(sort -r "$TMP")
+
+    rm -f "$TMP"
+
+    TEXT+="━━━━━━━━━━━━━━
+📊 ВСЕГО: $(format_bytes "$TOTAL")"
+
+    printf '%s' "$TEXT"
+}
+
+traffic_archive_month_markup() {
+    local MONTH="$1"
+
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"🔄 Обновить","callback_data":"traffic_archive_month:'"${MONTH}"'"}
+            ],
+            [
+                {"text":"◀️ Архив","callback_data":"traffic_archive"}
+            ],
+            [
+                {"text":"📈 Трафик","callback_data":"traffic"},
+                {"text":"🏠 Меню","callback_data":"menu"}
+            ]
+        ]
+    }'
+}
+
+traffic_history_text() {
+    local IP="$1"
+    local NAME
+
+    NAME=$(get_name "$IP")
+    [ -z "$NAME" ] && NAME="$IP"
+
+    local TEXT="📈 ${NAME}
+
+"
+
+    local TOTAL_BYTES=0
+    local COUNT=0
+
+    for FILE in /var/lib/awg-traffic/20??-??.tsv; do
+        [ -f "$FILE" ] || continue
+
+        local MONTH
+        MONTH=$(basename "$FILE" .tsv)
+
+        local BYTES
+        BYTES=$(awk -v ip="$IP" '$1 == ip {print $NF; exit}' "$FILE")
+
+        [ -z "$BYTES" ] && BYTES=0
+
+        local YEAR="${MONTH:0:4}"
+        local MON="${MONTH:5:2}"
+
+        local MONTH_NAME
+
+        case "$MON" in
+            01) MONTH_NAME="Январь" ;;
+            02) MONTH_NAME="Февраль" ;;
+            03) MONTH_NAME="Март" ;;
+            04) MONTH_NAME="Апрель" ;;
+            05) MONTH_NAME="Май" ;;
+            06) MONTH_NAME="Июнь" ;;
+            07) MONTH_NAME="Июль" ;;
+            08) MONTH_NAME="Август" ;;
+            09) MONTH_NAME="Сентябрь" ;;
+            10) MONTH_NAME="Октябрь" ;;
+            11) MONTH_NAME="Ноябрь" ;;
+            12) MONTH_NAME="Декабрь" ;;
+        esac
+
+        TEXT+="📅 ${MONTH_NAME} ${YEAR} — $(format_bytes "$BYTES")
+"
+        TOTAL_BYTES=$((TOTAL_BYTES + BYTES))
+        COUNT=$((COUNT + 1))
+    done
+
+    if [ "$COUNT" -eq 0 ]; then
+        TEXT+="Нет данных"
+    else
+        TEXT+="
+📊 Всего — $(format_bytes "$TOTAL_BYTES")"
+    fi
+
+    printf '%s' "$TEXT"
+}
+
+traffic_history_markup() {
+    local IP="$1"
+
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"🔄 Обновить","callback_data":"traffic_history:'"${IP}"'"}
+            ],
+            [
+                {"text":"◀️ Клиент","callback_data":"client:'"${IP}"'"}
+            ],
+            [
+                {"text":"👥 Клиенты","callback_data":"clients"},
+                {"text":"🏠 Главное меню","callback_data":"menu"}
+            ]
+        ]
+    }'
+}
+
+clients_text() {
+    local TOTAL=0
+    local ACTIVE=0
+    local OFF=0
+    local PAUSED=0
+
+    while read -r IP; do
+        [ -z "$IP" ] && continue
+
+        TOTAL=$((TOTAL + 1))
+
+        case "$(get_status "$IP")" in
+            ACTIVE) ACTIVE=$((ACTIVE + 1)) ;;
+            OFF) OFF=$((OFF + 1)) ;;
+            PAUSED) PAUSED=$((PAUSED + 1)) ;;
+        esac
+    done < <(get_clients)
+
+    cat <<TEXT
+👥 КЛИЕНТЫ
+
+Всего: ${TOTAL}
+🟢 Online: ${ACTIVE}
+🔴 Offline: ${OFF}
+⏸ Paused: ${PAUSED}
+
+Выбери клиента:
+TEXT
+}
+
+show_clients() {
+    local CHAT="$1"
+    local MESSAGE_ID="${2:-}"
+
+    # Обновляем AWG-кэш один раз перед формированием списка
+    refresh_awg_cache
+
+    local TEXT
+    TEXT=$(clients_text)
+
+    local MARKUP
+    MARKUP=$(clients_markup)
+
+    if [ -n "$MESSAGE_ID" ]; then
+        edit_message "$CHAT" "$MESSAGE_ID" "$TEXT" "$MARKUP"
+    else
+        api -X POST "${API}/sendMessage" \
+            -d "chat_id=${CHAT}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "reply_markup=${MARKUP}" \
+        >/dev/null
+    fi
+}
+
+problems_text() {
+    local COUNT=0
+    local TEXT="🔴 ПРОБЛЕМЫ
+
+"
+
+    while IFS= read -r IP; do
+        [ -z "$IP" ] && continue
+
+        local STATUS
+        STATUS=$(get_status "$IP")
+
+        # В проблемы попадают только реальные OFFLINE.
+        # PAUSED и NEVER здесь никогда не показываются.
+        [ "$STATUS" != "OFF" ] && continue
+
+        local NAME
+        NAME=$(get_name "$IP")
+        [ -z "$NAME" ] && NAME="$IP"
+
+        COUNT=$((COUNT + 1))
+
+        TEXT+="🔴 ${NAME}
+IP: ${IP}
+
+"
+    done < <(get_clients)
+
+    if [ "$COUNT" -eq 0 ]; then
+        TEXT+="✅ Проблем нет"
+    else
+        TEXT+="Всего проблем: ${COUNT}"
+    fi
+
+    printf '%s' "$TEXT"
+}
+
+problems_markup() {
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"🔄 Обновить","callback_data":"problems"}
+            ],
+            [
+                {"text":"👥 Клиенты","callback_data":"clients"},
+                {"text":"🏠 Главное меню","callback_data":"menu"}
+            ]
+        ]
+    }'
+}
+
+status_text() {
+    local TOTAL=0
+    local ACTIVE=0
+    local OFF=0
+    local PAUSED=0
+
+    while read -r IP; do
+        [ -z "$IP" ] && continue
+
+        TOTAL=$((TOTAL + 1))
+
+        case "$(get_status "$IP")" in
+            ACTIVE) ACTIVE=$((ACTIVE + 1)) ;;
+            OFF) OFF=$((OFF + 1)) ;;
+            PAUSED) PAUSED=$((PAUSED + 1)) ;;
+        esac
+    done < <(get_clients)
+
+    cat <<TEXT
+📊 AWG STATUS
+
+👥 Всего: ${TOTAL}
+
+🟢 Online: ${ACTIVE}
+🔴 Offline: ${OFF}
+⏸ Paused: ${PAUSED}
+TEXT
+}
+
+status_markup() {
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"👥 Клиенты","callback_data":"clients"},
+                {"text":"🔄 Обновить","callback_data":"status"}
+            ],
+            [
+                {"text":"🏠 Главное меню","callback_data":"menu"}
+            ]
+        ]
+    }'
+}
+
+health_text() {
+    local DOCKER="🔴"
+    local AWG="🔴"
+    local TIMER="🔴"
+    local BOT="🔴"
+
+    docker inspect "$CONTAINER" >/dev/null 2>&1 && DOCKER="🟢"
+
+    docker exec "$CONTAINER" awg show awg0 >/dev/null 2>&1 &&
+        AWG="🟢"
+
+    systemctl is-active --quiet awg-telegram-monitor.timer &&
+        TIMER="🟢"
+
+    systemctl is-active --quiet awg-telegram-bot.service &&
+        BOT="🟢"
+
+    # CPU — расчёт по /proc/stat, 2 замера
+    local CPU
+    CPU=$(awk '/^cpu / {
+        total=$2+$3+$4+$5+$6+$7+$8+$9+$10
+        idle=$5+$6
+        print total, idle
+        exit
+    }' /proc/stat)
+
+    local T1 I1 T2 I2
+    T1=$(echo "$CPU" | awk '{print $1}')
+    I1=$(echo "$CPU" | awk '{print $2}')
+
+    sleep 1
+
+    CPU=$(awk '/^cpu / {
+        total=$2+$3+$4+$5+$6+$7+$8+$9+$10
+        idle=$5+$6
+        print total, idle
+        exit
+    }' /proc/stat)
+
+    T2=$(echo "$CPU" | awk '{print $1}')
+    I2=$(echo "$CPU" | awk '{print $2}')
+
+    if [ -n "$T1" ] && [ -n "$I1" ] && [ -n "$T2" ] && [ -n "$I2" ] &&
+       [ "$T2" -gt "$T1" ]; then
+
+        local DT DI
+        DT=$((T2 - T1))
+        DI=$((I2 - I1))
+
+        CPU=$(awk -v dt="$DT" -v di="$DI" \
+            'BEGIN {
+                if (dt > 0)
+                    printf "%.0f", (100 * (dt-di) / dt)
+                else
+                    print "?"
+            }')
+    else
+        CPU="?"
+    fi
+
+    local RAM
+    RAM=$(free 2>/dev/null |
+        awk '/Mem:/ {printf "%.0f", $3/$2*100}')
+
+    [ -z "$RAM" ] && RAM="?"
+
+    local DISK
+    DISK=$(df -P / 2>/dev/null |
+        awk 'NR==2 {gsub("%","",$5); print $5}')
+
+    [ -z "$DISK" ] && DISK="?"
+
+    local UPTIME
+    UPTIME=$(uptime -p 2>/dev/null || echo "unknown")
+
+    cat <<TEXT
+🖥 SERVER HEALTH
+
+Docker: ${DOCKER}
+AWG: ${AWG}
+Monitor: ${TIMER}
+Telegram Bot: ${BOT}
+
+CPU: ${CPU}%
+RAM: ${RAM}%
+Disk: ${DISK}%
+
+Uptime: ${UPTIME}
+TEXT
+}
+
+health_markup() {
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"🔄 Обновить","callback_data":"health"},
+                {"text":"🔄 Restart AWG","callback_data":"restart_confirm"}
+            ],
+            [
+                {"text":"🏠 Главное меню","callback_data":"menu"}
+            ]
+        ]
+    }'
+}
+
+client_details() {
+    local IP="$1"
+
+    # Обновляем общий кэш максимум раз в AWG_CACHE_TTL секунд
+    refresh_awg_cache
+
+    local NAME
+    NAME="${CACHE_NAME[$IP]:-$IP}"
+
+    local STATUS
+    STATUS=$(get_status "$IP")
+
+    local ICON
+    ICON=$(status_icon "$STATUS")
+
+    local STATUS_LABEL
+    STATUS_LABEL=$(status_name "$STATUS")
+
+    local RX_BYTES="${CACHE_RX[$IP]:-0}"
+    local TX_BYTES="${CACHE_TX[$IP]:-0}"
+    local HS="${CACHE_HS[$IP]:-0}"
+
+    # Форматирование трафика
+    local RX="0"
+    local TX="0"
+
+    if [ "$RX_BYTES" != "0" ] && [ -n "$RX_BYTES" ]; then
+        RX="$RX_BYTES"
+    fi
+
+    if [ "$TX_BYTES" != "0" ] && [ -n "$TX_BYTES" ]; then
+        TX="$TX_BYTES"
+    fi
+
+    # Переводим байты в удобный вид
+    format_bytes() {
+        local B="${1:-0}"
+
+        if ! [[ "$B" =~ ^[0-9]+$ ]]; then
+            echo "$B"
+            return
+        fi
+
+        if [ "$B" -ge 1073741824 ]; then
+            awk -v b="$B" 'BEGIN {printf "%.2f GiB", b/1073741824}'
+        elif [ "$B" -ge 1048576 ]; then
+            awk -v b="$B" 'BEGIN {printf "%.2f MiB", b/1048576}'
+        elif [ "$B" -ge 1024 ]; then
+            awk -v b="$B" 'BEGIN {printf "%.2f KiB", b/1024}'
+        else
+            printf '%s B' "$B"
+        fi
+    }
+
+    RX=$(format_bytes "$RX_BYTES")
+    TX=$(format_bytes "$TX_BYTES")
+
+    local HANDSHAKE="нет"
+
+    if [ -n "$HS" ] && [ "$HS" != "0" ]; then
+        local NOW
+        local AGE
+
+        NOW=$(date +%s)
+        AGE=$((NOW - HS))
+
+        if [ "$AGE" -lt 0 ]; then
+            AGE=0
+        fi
+
+        if [ "$AGE" -lt 60 ]; then
+            HANDSHAKE="${AGE} сек. назад"
+        elif [ "$AGE" -lt 3600 ]; then
+            HANDSHAKE="$((AGE / 60)) мин. назад"
+        elif [ "$AGE" -lt 86400 ]; then
+            HANDSHAKE="$((AGE / 3600)) ч. назад"
+        else
+            HANDSHAKE="$((AGE / 86400)) дн. назад"
+        fi
+    fi
+
+    cat <<TEXT
+👤 ${NAME}
+
+IP: ${IP}
+Статус: ${ICON} ${STATUS_LABEL}
+
+RX: ${RX}
+TX: ${TX}
+Handshake: ${HANDSHAKE}
+TEXT
+}
+
+
+client_markup() {
+    local IP="$1"
+    local STATUS
+    STATUS=$(get_status "$IP")
+
+    local JSON='{"inline_keyboard":['
+
+    if [ "$STATUS" = "PAUSED" ]; then
+        JSON+='[
+            {"text":"▶️ Включить","callback_data":"resume:'"${IP}"'"}
+        ],'
+    else
+        JSON+='[
+            {"text":"⏸ Отключить","callback_data":"pause_confirm:'"${IP}"'"}
+        ],'
+    fi
+
+    JSON+='[
+        {"text":"📈 История трафика","callback_data":"traffic_history:'"${IP}"'"}
+    ],[
+        {"text":"🔄 Обновить","callback_data":"client:'"${IP}"'"}
+    ],[
+        {"text":"◀️ Назад","callback_data":"clients"}
+    ]]}'
+
+    printf '%s' "$JSON"
+}
+
+show_client() {
+    local CHAT="$1"
+    local MESSAGE_ID="$2"
+    local IP="$3"
+
+    local TEXT
+    TEXT=$(client_details "$IP")
+
+    local MARKUP
+    MARKUP=$(client_markup "$IP")
+
+    edit_message "$CHAT" "$MESSAGE_ID" "$TEXT" "$MARKUP"
+}
+
+pause_confirm_text() {
+    local IP="$1"
+
+    local NAME
+    NAME=$(get_name "$IP")
+    [ -z "$NAME" ] && NAME="UNKNOWN"
+
+    cat <<TEXT
+⚠️ ОТКЛЮЧИТЬ КЛИЕНТА?
+
+👤 ${NAME}
+IP: ${IP}
+
+Клиент перестанет подключаться к AWG.
+TEXT
+}
+
+pause_confirm_markup() {
+    local IP="$1"
+
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"✅ Да, отключить","callback_data":"pause:'"${IP}"'"},
+                {"text":"❌ Отмена","callback_data":"client:'"${IP}"'"}
+            ]
+        ]
+    }'
+}
+
+pause_client() {
+    local IP="$1"
+
+    if docker exec "$CONTAINER" "$AWG_DIR/pause.sh" "$IP" >/dev/null 2>&1; then
+        echo "⏸ Клиент отключён
+
+IP: ${IP}"
+    else
+        echo "🔴 Не удалось отключить клиента
+
+IP: ${IP}"
+    fi
+}
+
+resume_client() {
+    local IP="$1"
+
+    if docker exec "$CONTAINER" "$AWG_DIR/resume.sh" "$IP" >/dev/null 2>&1; then
+        echo "▶️ Клиент включён
+
+IP: ${IP}"
+    else
+        echo "🔴 Не удалось включить клиента
+
+IP: ${IP}"
+    fi
+}
+
+restart_awg() {
+    if docker restart "$CONTAINER" >/dev/null 2>&1; then
+        sleep 3
+
+        if docker exec "$CONTAINER" awg show awg0 >/dev/null 2>&1; then
+            echo "🟢 AWG успешно перезапущен"
+        else
+            echo "🔴 Контейнер запущен, но интерфейс AWG недоступен"
+        fi
+    else
+        echo "🔴 Не удалось перезапустить AWG"
+    fi
+}
+
+restart_confirm_markup() {
+    printf '%s' '{
+        "inline_keyboard":[
+            [
+                {"text":"✅ Перезапустить","callback_data":"restart"},
+                {"text":"❌ Отмена","callback_data":"health"}
+            ]
+        ]
+    }'
+}
+
+restart_confirm_text() {
+    printf '%s' '⚠️ ПЕРЕЗАПУСТИТЬ AWG?
+
+Все активные соединения будут разорваны.'
+}
+
+
+# =========================
+# CLIENT STATUS MONITOR
+# =========================
+
+MONITOR_INTERVAL=30
+MONITOR_LAST_CHECK=0
+MONITOR_STATE_FILE="${STATE_DIR}/client-status"
+
+declare -A MONITOR_STATUS
+
+load_monitor_state() {
+    MONITOR_STATUS=()
+
+    [ -f "$MONITOR_STATE_FILE" ] || return
+
+    while IFS='=' read -r IP STATUS; do
+        [ -n "$IP" ] && [ -n "$STATUS" ] &&
+            MONITOR_STATUS["$IP"]="$STATUS"
+    done < "$MONITOR_STATE_FILE"
+}
+
+save_monitor_state() {
+    local TMP="${MONITOR_STATE_FILE}.tmp"
+
+    : > "$TMP"
+
+    for IP in "${!MONITOR_STATUS[@]}"; do
+        printf '%s=%s\n' "$IP" "${MONITOR_STATUS[$IP]}"
+    done > "$TMP"
+
+    mv -f "$TMP" "$MONITOR_STATE_FILE"
+}
+
+notify_status_change() {
+    local IP="$1"
+    local OLD="$2"
+    local NEW="$3"
+
+    # NEVER и PAUSED никогда не являются тревогой.
+    if [ "$OLD" = "NEVER" ] || [ "$NEW" = "NEVER" ]; then
+        return
+    fi
+
+    if [ "$OLD" = "PAUSED" ] || [ "$NEW" = "PAUSED" ]; then
+        return
+    fi
+
+    local NAME
+    NAME=$(get_name "$IP")
+    [ -z "$NAME" ] && NAME="$IP"
+
+    local TEXT=""
+
+    case "$NEW" in
+        ACTIVE)
+            # ONLINE отправляем только после подтверждённого OFF.
+            [ "$OLD" != "OFF" ] && return
+
+            TEXT="🟢 Клиент снова ONLINE
+
+👤 ${NAME}
+IP: ${IP}
+
+Статус: Онлайн"
+            ;;
+
+        OFF)
+            # OFF отправляем только при переходе ACTIVE → OFF.
+            [ "$OLD" != "ACTIVE" ] && return
+
+            TEXT="🔴 Клиент OFFLINE
+
+👤 ${NAME}
+IP: ${IP}
+
+Статус: Оффлайн"
+            ;;
+
+        *)
+            return
+            ;;
+    esac
+
+    send_message "$CHAT_ID" "$TEXT"
+}
+
+monitor_clients() {
+    local NOW
+    NOW=$(date +%s)
+
+    if [ "$((NOW - MONITOR_LAST_CHECK))" -lt "$MONITOR_INTERVAL" ]; then
+        return
+    fi
+
+    MONITOR_LAST_CHECK="$NOW"
+
+    refresh_awg_cache
+
+    local CLIENTS
+    CLIENTS=$(get_clients 2>/dev/null)
+
+    [ -z "$CLIENTS" ] && return
+
+    local FIRST_RUN=0
+
+    if [ ! -f "$MONITOR_STATE_FILE" ]; then
+        FIRST_RUN=1
+    else
+        load_monitor_state
+    fi
+
+    local IP STATUS OLD
+
+    while IFS= read -r IP; do
+        [ -z "$IP" ] && continue
+
+        STATUS=$(get_status "$IP")
+        OLD="${MONITOR_STATUS[$IP]:-}"
+
+        MONITOR_STATUS["$IP"]="$STATUS"
+
+        if [ "$FIRST_RUN" -eq 0 ] && [ -n "$OLD" ] && [ "$OLD" != "$STATUS" ]; then
+            notify_status_change "$IP" "$OLD" "$STATUS"
+        fi
+
+    done <<< "$CLIENTS"
+
+    save_monitor_state
+}
+
+OFFSET=0
+
+if [ -f "$OFFSET_FILE" ]; then
+    OFFSET=$(cat "$OFFSET_FILE" 2>/dev/null || echo 0)
+fi
+
+while true; do
+
+
+    RESPONSE=$(api "${API}/getUpdates?timeout=25&offset=${OFFSET}" || true)
+
+    [ -z "$RESPONSE" ] && continue
+
+    PARSED=$(printf '%s' "$RESPONSE" | python3 -c '
+import sys
+import json
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+for update in data.get("result", []):
+
+    update_id = update.get("update_id")
+
+    if update_id is None:
+        continue
+
+    chat = ""
+    text = ""
+    callback_id = ""
+    callback_data = ""
+    message_id = ""
+
+    if "message" in update:
+        msg = update["message"]
+
+        message_id = str(msg.get("message_id", ""))
+
+        chat_obj = msg.get("chat", {})
+        chat = str(chat_obj.get("id", ""))
+
+        text = msg.get("text", "")
+
+    elif "callback_query" in update:
+
+        cb = update["callback_query"]
+
+        callback_id = str(cb.get("id", ""))
+        callback_data = cb.get("data", "")
+
+        msg = cb.get("message", {})
+
+        message_id = str(msg.get("message_id", ""))
+
+        chat_obj = msg.get("chat", {})
+        chat = str(chat_obj.get("id", ""))
+
+    print("UPDATE_ID=" + str(update_id))
+    print("CHAT=" + chat)
+    print("TEXT=" + text)
+    print("CALLBACK_ID=" + callback_id)
+    print("CALLBACK_DATA=" + callback_data)
+    print("MESSAGE_ID=" + message_id)
+    print("---")
+')
+
+    PARSED=$(printf '%s\n' "$PARSED" | awk '
+        BEGIN { block="" }
+        /^---$/ {
+            if (block != "") {
+                gsub(/\n/, "\t", block)
+                print block
+            }
+            block=""
+            next
+        }
+        {
+            if (block != "") block=block "\n"
+            block=block $0
+        }
+        END {
+            if (block != "") {
+                gsub(/\n/, "\t", block)
+                print block
+            }
+        }
+    ')
+
+    while IFS="$(printf '\t')" read -r BLOCK; do
+
+
+
+        [ -z "$BLOCK" ] && continue
+
+        BLOCK_NL=$(printf '%s' "$BLOCK" | tr '\t' '\n')
+
+        UPDATE_ID=$(printf '%s\n' "$BLOCK_NL" | sed -n 's/^UPDATE_ID=//p' | head -n1)
+        CHAT=$(printf '%s\n' "$BLOCK_NL" | sed -n 's/^CHAT=//p' | head -n1)
+        TEXT=$(printf '%s\n' "$BLOCK_NL" | sed -n 's/^TEXT=//p' | head -n1)
+        CALLBACK_ID=$(printf '%s\n' "$BLOCK_NL" | sed -n 's/^CALLBACK_ID=//p' | head -n1)
+        CALLBACK_DATA=$(printf '%s\n' "$BLOCK_NL" | sed -n 's/^CALLBACK_DATA=//p' | head -n1)
+        MESSAGE_ID=$(printf '%s\n' "$BLOCK_NL" | sed -n 's/^MESSAGE_ID=//p' | head -n1)
+
+        [ -z "$UPDATE_ID" ] && continue
+        [ -z "$CHAT" ] && continue
+        [ "$CHAT" != "$CHAT_ID" ] && continue
+
+        OFFSET=$((UPDATE_ID + 1))
+        echo "$OFFSET" > "$OFFSET_FILE"
+
+        # =========================
+        # CALLBACK BUTTONS
+        # =========================
+
+        if [ -n "$CALLBACK_ID" ]; then
+
+            answer_callback "$CALLBACK_ID"
+
+            case "$CALLBACK_DATA" in
+
+                menu)
+                    send_menu "$CHAT"
+                    ;;
+
+                clients)
+                    show_clients "$CHAT" "$MESSAGE_ID"
+                    ;;
+
+                traffic)
+                    refresh_awg_cache
+                    edit_message                         "$CHAT"                         "$MESSAGE_ID"                         "$(traffic_text)"                         "$(traffic_markup)"
+                    ;;
+
+                traffic_archive)
+                    edit_message                         "$CHAT"                         "$MESSAGE_ID"                         "$(traffic_archive_text)"                         "$(traffic_archive_markup)"
+                    ;;
+
+                traffic_archive_month:*)
+                    MONTH="${CALLBACK_DATA#traffic_archive_month:}"
+
+                    edit_message                         "$CHAT"                         "$MESSAGE_ID"                         "$(traffic_archive_month_text "$MONTH")"                         "$(traffic_archive_month_markup "$MONTH")"
+                    ;;
+
+
+                status)
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "$(status_text)" \
+                        "$(status_markup)"
+                    ;;
+
+
+                  problems)
+                      edit_message \
+                          "$CHAT" \
+                          "$MESSAGE_ID" \
+                          "$(problems_text)" \
+                          "$(problems_markup)"
+                      ;;
+
+                health)
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "$(health_text)" \
+                        "$(health_markup)"
+                    ;;
+
+                restart_confirm)
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "$(restart_confirm_text)" \
+                        "$(restart_confirm_markup)"
+                    ;;
+
+                restart)
+                    RESULT=$(restart_awg)
+
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "${RESULT}" \
+                        "$(health_markup)"
+                    ;;
+
+                client:*)
+                    IP="${CALLBACK_DATA#client:}"
+
+                    show_client \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "$IP"
+                    ;;
+
+                traffic_history:*)
+                    IP="${CALLBACK_DATA#traffic_history:}"
+
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "$(traffic_history_text "$IP")" \
+                        "$(traffic_history_markup "$IP")"
+                    ;;
+
+                pause_confirm:*)
+                    IP="${CALLBACK_DATA#pause_confirm:}"
+
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "$(pause_confirm_text "$IP")" \
+                        "$(pause_confirm_markup "$IP")"
+                    ;;
+
+                pause:*)
+                    IP="${CALLBACK_DATA#pause:}"
+
+                    RESULT=$(pause_client "$IP")
+
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "${RESULT}" \
+                        "$(client_markup "$IP")"
+                    ;;
+
+                resume:*)
+                    IP="${CALLBACK_DATA#resume:}"
+
+                    RESULT=$(resume_client "$IP")
+
+                    edit_message \
+                        "$CHAT" \
+                        "$MESSAGE_ID" \
+                        "${RESULT}" \
+                        "$(client_markup "$IP")"
+                    ;;
+
+            esac
+
+            continue
+        fi
+
+        # =========================
+        # TEXT COMMANDS
+        # =========================
+
+        case "$TEXT" in
+
+            /start)
+                send_menu "$CHAT"
+                ;;
+
+            /menu)
+                send_menu "$CHAT"
+                ;;
+
+            /clients)
+                show_clients "$CHAT"
+                ;;
+
+            /status)
+                send_message \
+                    "$CHAT" \
+                    "$(status_text)"
+                ;;
+
+            /health)
+                send_message \
+                    "$CHAT" \
+                    "$(health_text)"
+                ;;
+
+        esac
+
+    done < <(
+        printf '%s\n' "$PARSED" |
+        awk '
+            /^UPDATE_ID=/ {
+                if (block != "") print block
+                block=$0
+                next
+            }
+            {
+                if (block != "")
+                    block=block "\n" $0
+            }
+            END {
+                if (block != "")
+                    print block
+            }
+        '
+    )
+
+done

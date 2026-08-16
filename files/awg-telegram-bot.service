@@ -1,0 +1,14 @@
+[Unit]
+Description=Amnezia AWG Telegram Bot
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/awg-telegram-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
